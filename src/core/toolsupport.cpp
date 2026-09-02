@@ -1,12 +1,16 @@
 #include "toolsupport.hpp"
-#include <algorithm>
 #include <cerrno>
 
 #include <fcntl.h>
+#include <qbytearray.h>
 #include <qcontainerfwd.h>
+#include <qcryptographichash.h>
+#include <qdatetime.h>
 #include <qdebug.h>
 #include <qdir.h>
+#include <qendian.h>
 #include <qfile.h>
+#include <qfiledevice.h>
 #include <qfileinfo.h>
 #include <qlist.h>
 #include <qlogging.h>
@@ -14,6 +18,7 @@
 #include <qqmlengine.h>
 #include <qset.h>
 #include <qtenvironmentvariables.h>
+#include <qtypes.h>
 
 #include "logcat.hpp"
 #include "paths.hpp"
@@ -45,7 +50,7 @@ QString QmlToolingSupport::updateMirror(const QDir& configRoot, const QmlScanner
 	// the engine canonicalizes import paths, so every url derived from this one must match
 	auto vfsPath = vfs->canonicalPath();
 	if (vfsPath.isEmpty()) return QString();
-	if (!QmlToolingSupport::mirrorDir(scanner, configRoot, vfsPath % "/qs")) return QString();
+	if (!QmlToolingSupport::mirrorDir(scanner, configRoot, QDir(vfsPath % "/qs"))) return QString();
 
 	return vfsPath;
 }
@@ -53,30 +58,19 @@ QString QmlToolingSupport::updateMirror(const QDir& configRoot, const QmlScanner
 bool QmlToolingSupport::mirrorDir(
     const QmlScanner& scanner,
     const QDir& source,
-    const QString& target
+    const QDir& target
 ) {
-	const QString prefix = source.path() % '/';
-
-	auto hasIntercepts = std::any_of(
-	    scanner.fileIntercepts.keyBegin(),
-	    scanner.fileIntercepts.keyEnd(),
-	    [&](const QString& path) { return path.startsWith(prefix); }
-	);
-
-	if (!hasIntercepts) return QmlToolingSupport::linkMirrorEntry(source.path(), target);
-
-	auto targetInfo = QFileInfo(target);
+	auto targetInfo = QFileInfo(target.path());
 	if (targetInfo.isSymLink() || (targetInfo.exists() && !targetInfo.isDir())) {
-		QmlToolingSupport::removeMirrorEntry(target);
+		QmlToolingSupport::removeMirrorEntry(target.path());
 	}
 
-	auto targetDir = QDir(target);
-
-	if (!targetDir.mkpath(".")) {
-		qCCritical(logTooling) << "Could not create mirror dir at" << target;
+	if (!target.mkpath(".")) {
+		qCCritical(logTooling) << "Could not create mirror dir at" << target.path();
 		return false;
 	}
 
+	const QString prefix = source.path() % '/';
 	QSet<QString> names;
 
 	for (auto [path, text]: scanner.fileIntercepts.asKeyValueRange()) {
@@ -86,7 +80,7 @@ bool QmlToolingSupport::mirrorDir(
 		if (name.contains('/')) continue;
 
 		names.insert(name);
-		if (!QmlToolingSupport::writeMirrorFile(targetDir.filePath(name), text)) return false;
+		if (!QmlToolingSupport::writeMirrorFile(target.filePath(name), text.toUtf8())) return false;
 	}
 
 	auto filters = QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot;
@@ -95,22 +89,44 @@ bool QmlToolingSupport::mirrorDir(
 		if (names.contains(name)) continue;
 		names.insert(name);
 
-		auto path = source.filePath(name);
-		auto entryPath = targetDir.filePath(name);
-		auto ok = QFileInfo(path).isDir() ? QmlToolingSupport::mirrorDir(scanner, QDir(path), entryPath)
-		                                  : QmlToolingSupport::linkMirrorEntry(path, entryPath);
-
-		if (!ok) return false;
+		if (!QmlToolingSupport::mirrorEntry(scanner, source.filePath(name), target.filePath(name))) {
+			return false;
+		}
 	}
 
-	for (const auto& name: targetDir.entryList(filters)) {
-		if (!names.contains(name)) QmlToolingSupport::removeMirrorEntry(targetDir.filePath(name));
+	for (const auto& name: target.entryList(filters)) {
+		if (!names.contains(name)) QmlToolingSupport::removeMirrorEntry(target.filePath(name));
 	}
 
 	return true;
 }
 
-bool QmlToolingSupport::writeMirrorFile(const QString& path, const QString& text) {
+bool QmlToolingSupport::mirrorEntry(
+    const QmlScanner& scanner,
+    const QString& path,
+    const QString& target
+) {
+	auto info = QFileInfo(path);
+	auto name = info.fileName();
+
+	// hidden entries can't be modules and .git alone would be thousands of links
+	if (name.startsWith('.')) return QmlToolingSupport::linkMirrorEntry(path, target);
+	if (info.isDir()) return QmlToolingSupport::mirrorDir(scanner, QDir(path), QDir(target));
+
+	auto isDocument = name.endsWith(".qml") || name.endsWith(".js") || name.endsWith(".mjs");
+	if (!isDocument) return QmlToolingSupport::linkMirrorEntry(path, target);
+
+	auto file = QFile(path);
+
+	if (!file.open(QFile::ReadOnly)) {
+		qCWarning(logTooling) << "Could not read" << path << "for the mirror, linking it instead";
+		return QmlToolingSupport::linkMirrorEntry(path, target);
+	}
+
+	return QmlToolingSupport::writeMirrorFile(target, file.readAll());
+}
+
+bool QmlToolingSupport::writeMirrorFile(const QString& path, const QByteArray& data) {
 	auto info = QFileInfo(path);
 	if (info.isSymLink() || (info.exists() && !info.isFile())) {
 		QmlToolingSupport::removeMirrorEntry(path);
@@ -123,15 +139,25 @@ bool QmlToolingSupport::writeMirrorFile(const QString& path, const QString& text
 		return false;
 	}
 
-	auto data = text.toUtf8();
-	if (file.readAll() == data) return true;
+	if (file.readAll() != data) {
+		if (!file.resize(0) || file.write(data) != data.length() || !file.flush()) {
+			qCCritical(logTooling) << "Failed to write mirror file" << path;
+			return false;
+		}
 
-	if (!file.resize(0) || file.write(data) != data.length()) {
-		qCCritical(logTooling) << "Failed to write mirror file" << path;
+		qCDebug(logTooling) << "Wrote mirror file" << path;
+	}
+
+	// Qt validates cache entries by source mtime, which is always 1 in the nix store, so the
+	// mtime is derived from content instead. Spans 2000..2030 as a zero stamp disables the check.
+	auto hash = QCryptographicHash::hash(data, QCryptographicHash::Md5);
+	auto secs = 946684800 + qFromBigEndian<quint32>(hash.constData()) % 946684800;
+
+	if (!file.setFileTime(QDateTime::fromSecsSinceEpoch(secs), QFile::FileModificationTime)) {
+		qCCritical(logTooling) << "Failed to set mirror file time on" << path;
 		return false;
 	}
 
-	qCDebug(logTooling) << "Wrote mirror file" << path;
 	return true;
 }
 

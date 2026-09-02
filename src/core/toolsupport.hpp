@@ -15,8 +15,9 @@ private:
 	static QString getQmllsConfig();
 	static bool lockTooling();
 	static bool updateQmllsConfig(const QDir& configRoot, bool create);
-	static bool mirrorDir(const QmlScanner& scanner, const QDir& source, const QString& target);
-	static bool writeMirrorFile(const QString& path, const QString& text);
+	static bool mirrorDir(const QmlScanner& scanner, const QDir& source, const QDir& target);
+	static bool mirrorEntry(const QmlScanner& scanner, const QString& path, const QString& target);
+	static bool writeMirrorFile(const QString& path, const QByteArray& data);
 	static bool linkMirrorEntry(const QString& path, const QString& linkPath);
 	static void removeMirrorEntry(const QString& path);
 	static inline bool toolingEnabled = false;
